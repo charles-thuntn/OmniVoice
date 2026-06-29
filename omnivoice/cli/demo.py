@@ -25,6 +25,8 @@ Usage:
 
 import argparse
 import logging
+import tempfile
+from pathlib import Path
 from typing import Any, Dict
 
 import gradio as gr
@@ -32,6 +34,10 @@ import numpy as np
 import torch
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+from omnivoice.story_extractor import (
+    extract_story_from_html,
+    extract_story_from_url_async,
+)
 from omnivoice.utils.common import get_best_device
 from omnivoice.utils.lang_map import LANG_NAMES, lang_display_name
 
@@ -295,6 +301,87 @@ def build_demo(
             )
         return ns, gs, dn, sp, du, pp, po
 
+    async def _extract_from_url(url):
+        if not url or not url.strip():
+            return gr.update(), "Chưa nhập URL.", gr.update(value=None)
+
+        try:
+            result = await extract_story_from_url_async(url.strip())
+            txt_path = _write_story_txt(result.content, result.title)
+            return (
+                gr.update(value=result.content),
+                f"Extracted {len(result.content)} chars from URL. TXT ready.",
+                txt_path,
+            )
+        except Exception as exc:
+            return gr.update(), f"Extract failed: {exc}", gr.update(value=None)
+
+    def _extract_from_html_file(file):
+        if file is None:
+            return gr.update(), "Chưa chọn file HTML.", gr.update(value=None)
+
+        try:
+            file_path = Path(getattr(file, "name", file))
+            html = file_path.read_text(encoding="utf-8", errors="ignore")
+            result = extract_story_from_html(html, source=str(file_path))
+            txt_path = _write_story_txt(result.content, result.title)
+            return (
+                gr.update(value=result.content),
+                f"Extracted {len(result.content)} chars from HTML. TXT ready.",
+                txt_path,
+            )
+        except Exception as exc:
+            return gr.update(), f"Extract failed: {exc}", gr.update(value=None)
+
+    def _write_story_txt(content: str, title: str = "") -> str:
+        safe_title = "".join(c if c.isalnum() else "_" for c in title).strip("_")
+        prefix = (safe_title[:40] or "omnivoice_story") + "_"
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            errors="ignore",
+            suffix=".txt",
+            prefix=prefix,
+            delete=False,
+        ) as f:
+            f.write(content)
+            return f.name
+
+    def _story_extract_controls(target_textbox):
+        with gr.Accordion("Extract Story", open=False):
+            gr.Markdown("### Extract Story")
+            story_url_input = gr.Textbox(
+                label="Story URL",
+                placeholder="https://...",
+                lines=1,
+            )
+            extract_url_button = gr.Button("Extract from URL")
+            story_html_file = gr.File(
+                label="HTML file",
+                file_types=[".html", ".htm"],
+            )
+            extract_html_button = gr.Button("Extract from HTML")
+            extract_status = gr.Textbox(
+                label="Extract status",
+                lines=2,
+                interactive=False,
+            )
+            extract_txt_file = gr.File(
+                label="Download extracted TXT",
+                interactive=False,
+            )
+
+        extract_url_button.click(
+            fn=_extract_from_url,
+            inputs=[story_url_input],
+            outputs=[target_textbox, extract_status, extract_txt_file],
+        )
+        extract_html_button.click(
+            fn=_extract_from_html_file,
+            inputs=[story_html_file],
+            outputs=[target_textbox, extract_status, extract_txt_file],
+        )
+
     with gr.Blocks(theme=theme, css=css, title="OmniVoice Demo") as demo:
         gr.Markdown(
             """
@@ -322,6 +409,7 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             lines=4,
                             placeholder="Enter the text you want to synthesize...",
                         )
+                        _story_extract_controls(vc_text)
                         vc_ref_audio = gr.Audio(
                             label="Reference Audio / 参考音频",
                             type="filepath",
@@ -407,6 +495,7 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             lines=4,
                             placeholder="Enter the text you want to synthesize...",
                         )
+                        _story_extract_controls(vd_text)
                         vd_lang = _lang_dropdown()
 
                         _AUTO = "Auto"
