@@ -26,6 +26,8 @@ Usage:
 import argparse
 import logging
 import tempfile
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
@@ -307,10 +309,10 @@ def build_demo(
 
         try:
             result = await extract_story_from_url_async(url.strip())
-            txt_path = _write_story_txt(result.content, result.title)
+            txt_path = _write_story_txt(result.content)
             return (
                 gr.update(value=result.content),
-                f"Extracted {len(result.content)} chars from URL. TXT ready.",
+                f"Extracted {len(result.content)} chars from URL.",
                 txt_path,
             )
         except Exception as exc:
@@ -324,63 +326,152 @@ def build_demo(
             file_path = Path(getattr(file, "name", file))
             html = file_path.read_text(encoding="utf-8", errors="ignore")
             result = extract_story_from_html(html, source=str(file_path))
-            txt_path = _write_story_txt(result.content, result.title)
+            txt_path = _write_story_txt(result.content)
             return (
                 gr.update(value=result.content),
-                f"Extracted {len(result.content)} chars from HTML. TXT ready.",
+                f"Extracted {len(result.content)} chars from HTML.",
                 txt_path,
             )
         except Exception as exc:
             return gr.update(), f"Extract failed: {exc}", gr.update(value=None)
 
-    def _write_story_txt(content: str, title: str = "") -> str:
-        safe_title = "".join(c if c.isalnum() else "_" for c in title).strip("_")
-        prefix = (safe_title[:40] or "omnivoice_story") + "_"
+    def _write_story_txt(content: str) -> str:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         with tempfile.NamedTemporaryFile(
             "w",
             encoding="utf-8",
             errors="ignore",
             suffix=".txt",
-            prefix=prefix,
+            prefix=f"extracted_story_{timestamp}_",
             delete=False,
         ) as f:
             f.write(content)
             return f.name
 
-    def _story_extract_controls(target_textbox):
-        with gr.Accordion("Extract Story", open=False):
-            gr.Markdown("### Extract Story")
-            story_url_input = gr.Textbox(
-                label="Story URL",
-                placeholder="https://...",
-                lines=1,
-            )
-            extract_url_button = gr.Button("Extract from URL")
-            story_html_file = gr.File(
-                label="HTML file",
-                file_types=[".html", ".htm"],
-            )
-            extract_html_button = gr.Button("Extract from HTML")
-            extract_status = gr.Textbox(
-                label="Extract status",
-                lines=2,
-                interactive=False,
-            )
-            extract_txt_file = gr.File(
-                label="Download extracted TXT",
-                interactive=False,
-            )
+    def _audio_to_history_path(audio) -> str | None:
+        if audio is None:
+            return None
+        if isinstance(audio, str) and Path(audio).exists():
+            return audio
+        if isinstance(audio, tuple) and len(audio) == 2:
+            sr, waveform = audio
+            path = tempfile.NamedTemporaryFile(
+                suffix=".wav",
+                prefix="omnivoice_history_",
+                delete=False,
+            ).name
+            try:
+                import soundfile as sf
 
-        extract_url_button.click(
-            fn=_extract_from_url,
-            inputs=[story_url_input],
-            outputs=[target_textbox, extract_status, extract_txt_file],
+                sf.write(path, waveform, int(sr))
+                return path
+            except Exception:
+                return None
+        return None
+
+    def get_audio_duration(audio) -> str:
+        try:
+            if isinstance(audio, tuple) and len(audio) == 2:
+                sr, waveform = audio
+                seconds = len(waveform) / float(sr)
+            elif isinstance(audio, str) and Path(audio).exists():
+                import soundfile as sf
+
+                info = sf.info(audio)
+                seconds = info.frames / float(info.samplerate)
+            else:
+                return "Unknown"
+            seconds = max(0, int(round(seconds)))
+            hours = seconds // 3600
+            minutes = (seconds % 3600) // 60
+            seconds = seconds % 60
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        except Exception:
+            return "Unknown"
+
+    def create_history_item(audio, content, metadata=None) -> dict:
+        audio_path = _audio_to_history_path(audio)
+        return {
+            "id": str(uuid.uuid4()),
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "audio": audio_path or audio,
+            "audio_path": audio_path,
+            "duration": get_audio_duration(audio_path or audio),
+            "content": content or "",
+            "metadata": metadata or {},
+        }
+
+    def format_history_item_label(item) -> str:
+        content = " ".join((item.get("content") or "").split())
+        if len(content) > 80:
+            content = content[:77] + "..."
+        return (
+            f"{item.get('created_at', '')} | {item.get('duration', 'Unknown')} | "
+            f"{content or '(empty)'} | {item.get('id', '')[:8]}"
         )
-        extract_html_button.click(
-            fn=_extract_from_html_file,
-            inputs=[story_html_file],
-            outputs=[target_textbox, extract_status, extract_txt_file],
+
+    def _history_choices(history):
+        return [(format_history_item_label(item), item["id"]) for item in history or []]
+
+    def _history_detail_outputs(item):
+        if not item:
+            return (
+                None,
+                "No generated audio selected.",
+                "",
+                gr.update(value=None),
+            )
+        download_path = item.get("audio_path")
+        download_value = (
+            download_path if download_path and Path(download_path).exists() else None
         )
+        download_note = "" if download_value else "  \nDownload unavailable."
+        return (
+            item.get("audio"),
+            (
+                f"Generated: {item.get('created_at')}  \n"
+                f"Duration: {item.get('duration')}{download_note}"
+            ),
+            item.get("content", ""),
+            gr.update(value=download_value),
+        )
+
+    def _history_outputs(history):
+        choices = _history_choices(history)
+        selected_id = choices[0][1] if choices else None
+        selected_item = next(
+            (item for item in history or [] if item.get("id") == selected_id),
+            None,
+        )
+        audio, meta, content, download = _history_detail_outputs(selected_item)
+        return (
+            history or [],
+            gr.update(choices=choices, value=selected_id),
+            audio,
+            meta,
+            content,
+            download,
+        )
+
+    def _select_history_item(selected_id, history):
+        selected_item = next(
+            (item for item in history or [] if item.get("id") == selected_id),
+            None,
+        )
+        return _history_detail_outputs(selected_item)
+
+    def delete_selected_history_item(selected_id, history):
+        updated = [item for item in history or [] if item.get("id") != selected_id]
+        return _history_outputs(updated)
+
+    def generate_audio_with_history(generate_callable, content, audio_history, *args):
+        old_outputs = generate_callable(content, *args)
+        audio, status = old_outputs
+        updated_history = list(audio_history or [])
+        if audio is not None and not (isinstance(status, str) and status.startswith("Error:")):
+            item = create_history_item(audio, content)
+            updated_history.insert(0, item)
+        return (*old_outputs, *_history_outputs(updated_history))
 
     with gr.Blocks(theme=theme, css=css, title="OmniVoice Demo") as demo:
         gr.Markdown(
@@ -396,7 +487,50 @@ Built with [OmniVoice](https://github.com/k2-fsa/OmniVoice)
 by Xiaomi AI Lab Next-gen Kaldi team.
 """
         )
+        audio_history_state = gr.State([])
 
+        gr.Markdown("## Extract Story")
+        with gr.Tabs():
+            with gr.TabItem("URL"):
+                story_url_input = gr.Textbox(
+                    label="Story URL",
+                    placeholder="https://...",
+                    lines=1,
+                )
+                extract_url_button = gr.Button("Extract from URL")
+            with gr.TabItem("HTML File"):
+                story_html_file = gr.File(
+                    label="HTML file",
+                    file_types=[".html", ".htm"],
+                )
+                extract_html_button = gr.Button("Extract from HTML")
+        extract_status = gr.Textbox(
+            label="Extract status",
+            lines=2,
+            interactive=False,
+        )
+        extracted_content = gr.Textbox(
+            label="Extracted Content",
+            lines=18,
+            interactive=True,
+        )
+        extracted_txt_file = gr.File(
+            label="Download extracted TXT",
+            interactive=False,
+        )
+
+        extract_url_button.click(
+            fn=_extract_from_url,
+            inputs=[story_url_input],
+            outputs=[extracted_content, extract_status, extracted_txt_file],
+        )
+        extract_html_button.click(
+            fn=_extract_from_html_file,
+            inputs=[story_html_file],
+            outputs=[extracted_content, extract_status, extracted_txt_file],
+        )
+
+        gr.Markdown("## Generate Audio")
         with gr.Tabs():
             # ==============================================================
             # Voice Clone
@@ -409,7 +543,6 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             lines=4,
                             placeholder="Enter the text you want to synthesize...",
                         )
-                        _story_extract_controls(vc_text)
                         vc_ref_audio = gr.Audio(
                             label="Reference Audio / 参考音频",
                             type="filepath",
@@ -465,25 +598,6 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         ref_text=ref_text or None,
                     )
 
-                vc_btn.click(
-                    _clone_fn,
-                    inputs=[
-                        vc_text,
-                        vc_lang,
-                        vc_ref_audio,
-                        vc_ref_text,
-                        vc_instruct,
-                        vc_ns,
-                        vc_gs,
-                        vc_dn,
-                        vc_sp,
-                        vc_du,
-                        vc_pp,
-                        vc_po,
-                    ],
-                    outputs=[vc_audio, vc_status],
-                )
-
             # ==============================================================
             # Voice Design
             # ==============================================================
@@ -495,7 +609,6 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             lines=4,
                             placeholder="Enter the text you want to synthesize...",
                         )
-                        _story_extract_controls(vd_text)
                         vd_lang = _lang_dropdown()
 
                         _AUTO = "Auto"
@@ -565,22 +678,155 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         mode="design",
                     )
 
-                vd_btn.click(
-                    _design_fn,
-                    inputs=[
-                        vd_text,
-                        vd_lang,
-                        vd_ns,
-                        vd_gs,
-                        vd_dn,
-                        vd_sp,
-                        vd_du,
-                        vd_pp,
-                        vd_po,
-                    ]
-                    + vd_groups,
-                    outputs=[vd_audio, vd_status],
+        gr.Markdown("## Generated Audio History")
+        history_dropdown = gr.Dropdown(
+            label="Generated items",
+            choices=[],
+            value=None,
+            interactive=True,
+        )
+        with gr.Row():
+            with gr.Column(scale=1):
+                history_audio = gr.Audio(
+                    label="Audio preview",
+                    type="filepath",
+                    elem_classes="compact-audio",
                 )
+                history_download_file = gr.File(
+                    label="Download audio",
+                    interactive=False,
+                )
+                delete_history_button = gr.Button("Delete selected")
+            with gr.Column(scale=1):
+                history_meta = gr.Markdown("No generated audio selected.")
+                history_content = gr.Textbox(
+                    label="Content used to generate audio",
+                    lines=6,
+                    interactive=False,
+                )
+
+        def _clone_fn_with_history(
+            text,
+            lang,
+            ref_aud,
+            ref_text,
+            instruct,
+            ns,
+            gs,
+            dn,
+            sp,
+            du,
+            pp,
+            po,
+            audio_history,
+        ):
+            return generate_audio_with_history(
+                _clone_fn,
+                text,
+                audio_history,
+                lang,
+                ref_aud,
+                ref_text,
+                instruct,
+                ns,
+                gs,
+                dn,
+                sp,
+                du,
+                pp,
+                po,
+            )
+
+        def _design_fn_with_history(
+            text,
+            lang,
+            ns,
+            gs,
+            dn,
+            sp,
+            du,
+            pp,
+            po,
+            audio_history,
+            *groups,
+        ):
+            return generate_audio_with_history(
+                _design_fn,
+                text,
+                audio_history,
+                lang,
+                ns,
+                gs,
+                dn,
+                sp,
+                du,
+                pp,
+                po,
+                *groups,
+            )
+
+        history_outputs = [
+            audio_history_state,
+            history_dropdown,
+            history_audio,
+            history_meta,
+            history_content,
+            history_download_file,
+        ]
+
+        vc_btn.click(
+            _clone_fn_with_history,
+            inputs=[
+                vc_text,
+                vc_lang,
+                vc_ref_audio,
+                vc_ref_text,
+                vc_instruct,
+                vc_ns,
+                vc_gs,
+                vc_dn,
+                vc_sp,
+                vc_du,
+                vc_pp,
+                vc_po,
+                audio_history_state,
+            ],
+            outputs=[vc_audio, vc_status] + history_outputs,
+        )
+
+        vd_btn.click(
+            _design_fn_with_history,
+            inputs=[
+                vd_text,
+                vd_lang,
+                vd_ns,
+                vd_gs,
+                vd_dn,
+                vd_sp,
+                vd_du,
+                vd_pp,
+                vd_po,
+                audio_history_state,
+            ]
+            + vd_groups,
+            outputs=[vd_audio, vd_status] + history_outputs,
+        )
+
+        history_dropdown.change(
+            fn=_select_history_item,
+            inputs=[history_dropdown, audio_history_state],
+            outputs=[
+                history_audio,
+                history_meta,
+                history_content,
+                history_download_file,
+            ],
+        )
+        delete_history_button.click(
+            fn=delete_selected_history_item,
+            inputs=[history_dropdown, audio_history_state],
+            outputs=history_outputs,
+        )
 
     return demo
 
